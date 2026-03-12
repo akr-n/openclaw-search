@@ -42,6 +42,11 @@
         "default": 15,
         "minimum": 5,
         "maximum": 60
+      },
+      "serpApiKey": {
+        "type": "string",
+        "title": "SerpAPI Key",
+        "description": "SerpAPI key for Google News searches (optional, 250 free/month)"
       }
     }
   },
@@ -62,6 +67,10 @@
     },
     "timeout": {
       "label": "Timeout (seconds)"
+    },
+    "serpApiKey": {
+      "label": "SerpAPI Key",
+      "placeholder": "your-serpapi-key"
     }
   }
 }

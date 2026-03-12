@@ -22,6 +22,7 @@ interface PluginConfig {
   language?: string;
   safesearch?: number;
   timeout?: number;
+  serpApiKey?: string;
 }
 
 /**
@@ -178,105 +179,131 @@ export default function (api: OpenClawPluginApi) {
   }
 
   /**
-   * Generic search function
+   * Fetch from a single SearXNG URL
+   */
+  async function fetchSearxng(url: string, timeout: number): Promise<any> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json', 'User-Agent': 'OpenClaw/openclaw-search/1.0.0' },
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!response.ok) throw new Error(`SearXNG returned ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Fetch Google results with retry — if first attempt returns 0 results,
+   * retry once (IPRoyal rotates IP each request so second try gets a new IP).
+   */
+  async function fetchGoogleWithRetry(url: string, timeout: number, maxRetries = 2): Promise<any> {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const data = await fetchSearxng(url, timeout);
+        const count = (data.results || []).length;
+        if (count > 0) return data;
+        if (attempt < maxRetries) {
+          logSearch({ event: 'google_retry', attempt, reason: '0 results, rotating IP' });
+        }
+      } catch (err) {
+        if (attempt >= maxRetries) return { results: [] };
+      }
+    }
+    return { results: [] };
+  }
+
+  /**
+   * Generic search function — fires parallel requests to all engines + Google separately,
+   * then merges results with Google prioritized.
    */
   async function performSearch(params: SearchParams) {
     const { query, count, category, formatResult } = params;
 
     try {
-      // Validate input
       const validatedQuery = validateQuery(query);
-
-      // Get configuration with defaults
       const baseUrl = pluginConfig.baseUrl || 'http://localhost:8888';
       const maxResults = Math.min(Math.max(count || pluginConfig.maxResults || 10, 1), 100);
       const language = pluginConfig.language || 'en';
       const safesearch = pluginConfig.safesearch ?? 0;
       const timeout = (pluginConfig.timeout || 15) * 1000;
 
-      // Build search URL
-      const searchUrl = buildSearchUrl({
-        baseUrl,
-        query: validatedQuery,
-        category,
-        language,
-        safesearch
-      });
-
-      // Check cache first
       const cacheKey = `${validatedQuery}::${category}`;
       const cachedData = searchCache.get(cacheKey);
       const t0 = Date.now();
 
-      let data: any;
       if (cachedData) {
-        data = cachedData;
-        logSearch({ query: validatedQuery, category, cache: "hit", ms: Date.now() - t0, results: (data.results || []).length });
-      } else {
-        // Perform search with timeout
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeout);
+        logSearch({ query: validatedQuery, category, cache: "hit", ms: Date.now() - t0, results: (cachedData.results || []).length });
+        const results = (cachedData.results || []).slice(0, maxResults);
+        const text = formatResults(results, validatedQuery, formatResult, cachedData);
+        return { content: [{ type: 'text', text }] };
+      }
 
-        try {
-          const response = await fetch(searchUrl, {
-            method: 'GET',
-            headers: {
-              'Accept': 'application/json',
-              'User-Agent': 'OpenClaw/openclaw-search/1.0.0'
-            },
-            signal: controller.signal
-          });
+      // Build URLs: combined (all engines) + Google-only
+      const combinedUrl = buildSearchUrl({ baseUrl, query: validatedQuery, category, language, safesearch });
+      const googleEngines = category === 'images' ? 'google+images'
+        : category === 'videos' ? 'google+videos'
+        : category === 'news' ? 'google+news'
+        : 'google';
+      const googleUrl = combinedUrl + `&engines=${encodeURIComponent(googleEngines)}`;
 
-          clearTimeout(timeoutId);
+      // Fire both in parallel — don't let one failure kill the other
+      const [combinedResult, googleResult] = await Promise.allSettled([
+        fetchSearxng(combinedUrl, timeout),
+        fetchGoogleWithRetry(googleUrl, timeout)
+      ]);
 
-          if (!response.ok) {
-            throw new Error(`SearXNG returned ${response.status}: ${response.statusText}`);
-          }
+      const combinedData = combinedResult.status === 'fulfilled' ? combinedResult.value : { results: [] };
+      const googleData = googleResult.status === 'fulfilled' ? googleResult.value : { results: [] };
 
-          data = await response.json();
+      // Merge: start with Google results, then add non-duplicate combined results
+      const seenUrls = new Set<string>();
+      const merged: any[] = [];
 
-          if (!data || typeof data !== 'object') {
-            throw new Error('Invalid response format from SearXNG');
-          }
-
-          // Store in cache
-          searchCache.set(cacheKey, data);
-
-          const elapsed = Date.now() - t0;
-          const engines = [...new Set((data.results || []).map((r: any) => r.engine))];
-          logSearch({ query: validatedQuery, category, cache: "miss", ms: elapsed, results: (data.results || []).length, engines });
-
-        } finally {
-          clearTimeout(timeoutId);
+      // Google results first (weighted higher)
+      for (const r of (googleData.results || [])) {
+        if (r.url && !seenUrls.has(r.url)) {
+          seenUrls.add(r.url);
+          merged.push(r);
         }
       }
 
-      const results = (data.results || []).slice(0, maxResults);
+      // Then combined results (Brave, Startpage, etc.)
+      for (const r of (combinedData.results || [])) {
+        if (r.url && !seenUrls.has(r.url)) {
+          seenUrls.add(r.url);
+          merged.push(r);
+        }
+      }
+
+      const data = { ...combinedData, results: merged, answers: combinedData.answers || googleData.answers };
+      searchCache.set(cacheKey, data);
+
+      const elapsed = Date.now() - t0;
+      const engines = [...new Set(merged.map((r: any) => r.engine))];
+      logSearch({ query: validatedQuery, category, cache: "miss", ms: elapsed, results: merged.length, engines });
+
+      const results = merged.slice(0, maxResults);
       const text = formatResults(results, validatedQuery, formatResult, data);
 
-      return {
-        content: [{ type: 'text', text }]
-      };
+      return { content: [{ type: 'text', text }] };
 
     } catch (err: any) {
-      // Detailed error messages
       let errorMsg = 'Search failed: ';
-
       if (err.name === 'AbortError') {
         errorMsg += `Request timeout after ${pluginConfig.timeout || 15} seconds`;
       } else if (err.message.includes('fetch')) {
-        errorMsg += `Cannot connect to SearXNG at ${pluginConfig.baseUrl || 'http://localhost:8888'}. `;
-        errorMsg += 'Make sure SearXNG is running.';
+        errorMsg += `Cannot connect to SearXNG at ${pluginConfig.baseUrl || 'http://localhost:8888'}. Make sure SearXNG is running.`;
       } else {
         errorMsg += err.message;
       }
-
       logSearch({ query, category, cache: "error", error: errorMsg });
-
-      return {
-        content: [{ type: 'text', text: errorMsg }],
-        isError: true
-      };
+      return { content: [{ type: 'text', text: errorMsg }], isError: true };
     }
   }
 
@@ -336,6 +363,90 @@ export default function (api: OpenClawPluginApi) {
   }
 
   /**
+   * SerpAPI Google News search (uses paid API sparingly)
+   */
+  const SERPAPI_KEY = pluginConfig.serpApiKey || '2e12e1e647e88db6946676de7c8d097c206d134fd7177f23104af6489f096836';
+
+  async function performSerpApiNews(query: string, count?: number) {
+    const validatedQuery = validateQuery(query);
+    const maxResults = Math.min(count || pluginConfig.maxResults || 10, 20);
+    const cacheKey = `serpapi_news::${validatedQuery}`;
+    const cached = searchCache.get(cacheKey);
+    const t0 = Date.now();
+
+    if (cached) {
+      logSearch({ query: validatedQuery, category: 'serpapi_news', cache: 'hit', ms: Date.now() - t0, results: cached.length });
+      const text = formatSerpApiNews(cached, validatedQuery, maxResults);
+      return { content: [{ type: 'text', text }] };
+    }
+
+    try {
+      const url = `https://serpapi.com/search?engine=google_news&q=${encodeURIComponent(validatedQuery)}&api_key=${SERPAPI_KEY}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000);
+
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`SerpAPI returned ${response.status}: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const results = data.news_results || [];
+      searchCache.set(cacheKey, results);
+
+      const elapsed = Date.now() - t0;
+      logSearch({ query: validatedQuery, category: 'serpapi_news', cache: 'miss', ms: elapsed, results: results.length });
+
+      const text = formatSerpApiNews(results, validatedQuery, maxResults);
+      return { content: [{ type: 'text', text }] };
+
+    } catch (err: any) {
+      logSearch({ query: validatedQuery, category: 'serpapi_news', cache: 'error', error: err.message });
+      // Fallback to SearXNG news
+      return performSearch({
+        query: validatedQuery,
+        count: maxResults,
+        category: 'news',
+        formatResult: (result: any, idx: number) => {
+          let text = `${idx + 1}. **${result.title}**\n`;
+          text += `   ${result.url}\n`;
+          if (result.publishedDate) {
+            try { text += `   ${new Date(result.publishedDate).toLocaleDateString()}\n`; } catch {}
+          }
+          if (result.content) text += `   ${result.content.substring(0, 200)}...\n`;
+          return text + '\n';
+        }
+      });
+    }
+  }
+
+  function formatSerpApiNews(results: any[], query: string, max: number): string {
+    if (!results || results.length === 0) {
+      return `No news results found for "${query}".`;
+    }
+    const sliced = results.slice(0, max);
+    let text = `Found ${sliced.length} news result${sliced.length !== 1 ? 's' : ''} for "${query}" (via Google News):\n\n`;
+    sliced.forEach((r: any, idx: number) => {
+      text += `${idx + 1}. **${r.title}**\n`;
+      if (r.link) text += `   ${r.link}\n`;
+      if (r.source?.name) text += `   Source: ${r.source.name}`;
+      if (r.date) text += ` | ${r.date}`;
+      text += '\n';
+      if (r.snippet) text += `   ${r.snippet.substring(0, 200)}\n`;
+      // Include sub-stories if present
+      if (r.stories && r.stories.length > 0) {
+        r.stories.slice(0, 2).forEach((s: any) => {
+          text += `   → ${s.title} (${s.source?.name || ''})\n`;
+        });
+      }
+      text += '\n';
+    });
+    return text;
+  }
+
+  /**
    * Search tool configurations
    */
   const searchTools: SearchToolConfig[] = [
@@ -353,25 +464,7 @@ export default function (api: OpenClawPluginApi) {
         return text + '\n';
       }
     },
-    {
-      name: 'search_news',
-      description: 'Search for news articles using SearXNG.',
-      category: 'news',
-      formatResult: (result, idx) => {
-        let text = `${idx + 1}. **${result.title}**\n`;
-        text += `   ${result.url}\n`;
-        if (result.publishedDate) {
-          try {
-            const date = new Date(result.publishedDate);
-            text += `   ${date.toLocaleDateString()}\n`;
-          } catch {}
-        }
-        if (result.content) {
-          text += `   ${result.content.substring(0, 200)}...\n`;
-        }
-        return text + '\n';
-      }
-    },
+    // search_news is registered separately via SerpAPI below
     {
       name: 'search_images',
       description: 'Search for images using your SearXNG instance. Returns image URLs and metadata.',
@@ -435,8 +528,25 @@ export default function (api: OpenClawPluginApi) {
     }
   ];
 
-  // Register all search tools
+  // Register all SearXNG search tools
   searchTools.forEach(config => {
     api.registerTool(createSearchTool(config));
+  });
+
+  // Register SerpAPI Google News tool
+  api.registerTool({
+    name: 'search_news',
+    description: 'Search for news articles using Google News (via SerpAPI). Best for current events and breaking news.',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'News search query (max 500 characters)' },
+        count: { type: 'number', description: 'Number of results (1-20)', default: 10, minimum: 1, maximum: 20 }
+      },
+      required: ['query']
+    },
+    async execute(_id: string, params: any) {
+      return performSerpApiNews(params.query, params.count);
+    }
   });
 }
